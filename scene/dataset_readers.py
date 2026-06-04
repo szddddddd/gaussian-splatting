@@ -142,6 +142,152 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
+def _has_mapfree_metadata(path: Path):
+    return (path / "intrinsics.txt").exists() and (path / "poses.txt").exists()
+
+def isMapFreeScenePath(path):
+    source_path = Path(path)
+    return (
+        (source_path.name == "seq0" and _has_mapfree_metadata(source_path.parent)) or
+        (_has_mapfree_metadata(source_path) and (source_path / "seq0").is_dir())
+    )
+
+def resolveMapFreeScenePath(path):
+    source_path = Path(path)
+    if source_path.name == "seq0" and _has_mapfree_metadata(source_path.parent):
+        return source_path.parent, source_path.name
+    if _has_mapfree_metadata(source_path) and (source_path / "seq0").is_dir():
+        return source_path, "seq0"
+    raise RuntimeError(
+        f"Could not resolve MapFree scene root from '{path}'. Expected a scene root with "
+        "intrinsics.txt, poses.txt, and seq0/, or the seq0 directory itself."
+    )
+
+def _readMapFreeIntrinsics(intrinsics_path, sequence_name):
+    intrinsics_by_frame = {}
+    prefix = f"{sequence_name}/"
+    with open(intrinsics_path, "r") as intrinsics_file:
+        for line in intrinsics_file:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            elems = line.split()
+            frame_path = elems[0]
+            if not frame_path.startswith(prefix):
+                continue
+            intrinsics_by_frame[frame_path] = {
+                "fx": float(elems[1]),
+                "fy": float(elems[2]),
+                "cx": float(elems[3]),
+                "cy": float(elems[4]),
+                "width": int(elems[5]),
+                "height": int(elems[6]),
+            }
+    return intrinsics_by_frame
+
+def _readMapFreePoses(poses_path, sequence_name):
+    poses_by_frame = {}
+    prefix = f"{sequence_name}/"
+    with open(poses_path, "r") as poses_file:
+        for line in poses_file:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            elems = line.split()
+            frame_path = elems[0]
+            if not frame_path.startswith(prefix):
+                continue
+            poses_by_frame[frame_path] = {
+                "qvec": np.array(tuple(map(float, elems[1:5]))),
+                "tvec": np.array(tuple(map(float, elems[5:8]))),
+            }
+    return poses_by_frame
+
+def _sampleMapFreeFrames(frame_paths, sample_count=80):
+    if len(frame_paths) <= sample_count:
+        return frame_paths
+    sample_indices = np.unique(np.linspace(0, len(frame_paths) - 1, sample_count, dtype=int))
+    return [frame_paths[idx] for idx in sample_indices]
+
+def _buildMapFreeCameraInfos(scene_root, sequence_name, eval, llffhold):
+    intrinsics_by_frame = _readMapFreeIntrinsics(scene_root / "intrinsics.txt", sequence_name)
+    poses_by_frame = _readMapFreePoses(scene_root / "poses.txt", sequence_name)
+
+    aligned_frame_paths = []
+    for frame_path in sorted(set(intrinsics_by_frame.keys()) & set(poses_by_frame.keys())):
+        if (scene_root / frame_path).is_file():
+            aligned_frame_paths.append(frame_path)
+
+    sampled_frame_paths = _sampleMapFreeFrames(aligned_frame_paths)
+
+    cam_infos = []
+    for uid, frame_path in enumerate(sampled_frame_paths):
+        intr = intrinsics_by_frame[frame_path]
+        pose = poses_by_frame[frame_path]
+        image_path = scene_root / frame_path
+
+        width = intr["width"]
+        height = intr["height"]
+        with Image.open(image_path) as image:
+            actual_width, actual_height = image.size
+        if (actual_width, actual_height) != (width, height):
+            print(
+                f"Warning: MapFree metadata size mismatch for {frame_path}: "
+                f"metadata=({width}, {height}), image=({actual_width}, {actual_height}). "
+                "Using actual image size."
+            )
+            width = actual_width
+            height = actual_height
+
+        is_test = eval and llffhold and uid % llffhold == 0
+        image_name = Path(frame_path).with_suffix("").as_posix().replace("/", "_")
+
+        cam_infos.append(CameraInfo(
+            uid=uid,
+            R=np.transpose(qvec2rotmat(pose["qvec"])),
+            T=pose["tvec"],
+            FovY=focal2fov(intr["fy"], height),
+            FovX=focal2fov(intr["fx"], width),
+            depth_params=None,
+            image_path=str(image_path),
+            image_name=image_name,
+            depth_path="",
+            width=width,
+            height=height,
+            is_test=is_test,
+        ))
+
+    return cam_infos, len(aligned_frame_paths), len(sampled_frame_paths)
+
+def _loadMapFreePointCloud(scene_root, nerf_normalization):
+    sparse_root = scene_root / "sparse" / "0"
+    ply_path = sparse_root / "points3D.ply"
+    bin_path = sparse_root / "points3D.bin"
+    txt_path = sparse_root / "points3D.txt"
+
+    if ply_path.exists() or bin_path.exists() or txt_path.exists():
+        if not ply_path.exists():
+            print("Converting MapFree sparse point cloud to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
+        return fetchPly(ply_path), str(ply_path), "colmap_sparse"
+
+    ply_path = scene_root / "mapfree_points3D.ply"
+    if not ply_path.exists():
+        num_pts = 10_000
+        print(f"Generating random MapFree point cloud ({num_pts})...")
+        box_scale = 0.1
+        radius = max(float(nerf_normalization["radius"]), 1e-3)*box_scale
+        center = -np.asarray(nerf_normalization["translate"])
+        rng = np.random.default_rng(0)
+        xyz = center + (rng.random((num_pts, 3)) * 2.0 - 1.0) * radius
+        shs = rng.random((num_pts, 3)) / 255.0
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    return fetchPly(ply_path), str(ply_path), "random"
+
 def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
@@ -309,7 +455,41 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
                            is_nerf_synthetic=True)
     return scene_info
 
+def readMapFreeSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+    scene_root, sequence_name = resolveMapFreeScenePath(path)
+    cam_infos, total_aligned_frames, sampled_frames = _buildMapFreeCameraInfos(scene_root, sequence_name, eval, llffhold)
+
+    train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
+    test_cam_infos = [c for c in cam_infos if c.is_test]
+
+    if not train_cam_infos:
+        raise RuntimeError(
+            f"No MapFree training cameras found for '{path}'. "
+            f"Aligned {total_aligned_frames} frames and sampled {sampled_frames}. "
+            "Check that intrinsics.txt, poses.txt, and seq0 image files align."
+        )
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    pcd, ply_path, point_cloud_source = _loadMapFreePointCloud(scene_root, nerf_normalization)
+    if pcd is None:
+        raise RuntimeError(f"Failed to load or generate MapFree point cloud at '{ply_path}'.")
+
+    print(
+        f"Loaded MapFree scene '{scene_root.name}/{sequence_name}': "
+        f"aligned {total_aligned_frames} frames, sampled {sampled_frames}, "
+        f"train={len(train_cam_infos)}, test={len(test_cam_infos)}, point_cloud={point_cloud_source}."
+    )
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           is_nerf_synthetic=False)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "MapFree": readMapFreeSceneInfo
 }
