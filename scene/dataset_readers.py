@@ -145,12 +145,35 @@ def storePly(path, xyz, rgb):
 def _has_mapfree_metadata(path: Path):
     return (path / "intrinsics.txt").exists() and (path / "poses.txt").exists()
 
+def _has_blendedmvs_scene_layout(path: Path):
+    if not path.is_dir():
+        return False
+    images_dir = path / "blended_images"
+    cams_dir = path / "cams"
+    return images_dir.is_dir() and cams_dir.is_dir() and any(cams_dir.glob("*_cam.txt"))
+
+def _blendedmvs_frame_sort_key(path: Path):
+    stem = path.stem
+    if stem.endswith("_cam"):
+        stem = stem[:-4]
+    if stem.endswith("_masked"):
+        stem = stem[:-7]
+    return (0, int(stem)) if stem.isdigit() else (1, stem)
+
 def isMapFreeScenePath(path):
     source_path = Path(path)
     return (
         (source_path.name == "seq0" and _has_mapfree_metadata(source_path.parent)) or
         (_has_mapfree_metadata(source_path) and (source_path / "seq0").is_dir())
     )
+
+def isBlendedMVSScenePath(path):
+    source_path = Path(path)
+    if _has_blendedmvs_scene_layout(source_path):
+        return True
+    if not source_path.is_dir():
+        return False
+    return any(_has_blendedmvs_scene_layout(child) for child in source_path.iterdir() if child.is_dir())
 
 def resolveMapFreeScenePath(path):
     source_path = Path(path)
@@ -162,6 +185,43 @@ def resolveMapFreeScenePath(path):
         f"Could not resolve MapFree scene root from '{path}'. Expected a scene root with "
         "intrinsics.txt, poses.txt, and seq0/, or the seq0 directory itself."
     )
+
+def resolveBlendedMVSScenePaths(path):
+    source_path = Path(path)
+    if _has_blendedmvs_scene_layout(source_path):
+        return source_path, False
+    if not source_path.is_dir():
+        raise RuntimeError(
+            f"Could not resolve BlendedMVS scene root from '{path}'. "
+            "Expected a scene directory or dataset root directory."
+        )
+
+    candidate_scenes = sorted(
+        [child for child in source_path.iterdir() if _has_blendedmvs_scene_layout(child)],
+        key=lambda candidate: candidate.name
+    )
+    if not candidate_scenes:
+        raise RuntimeError(
+            f"Could not resolve BlendedMVS scene root from '{path}'. Expected either "
+            "a scene containing blended_images/ and cams/, or a dataset root with child scene directories."
+        )
+
+    requested_scene_id = os.environ.get("BLENDEDMVS_SCENE_ID")
+    if requested_scene_id:
+        requested_scene = source_path / requested_scene_id
+        if _has_blendedmvs_scene_layout(requested_scene):
+            return requested_scene, True
+        raise RuntimeError(
+            f"BLENDEDMVS_SCENE_ID='{requested_scene_id}' does not resolve to a valid BlendedMVS scene under "
+            f"'{source_path}'."
+        )
+
+    selected_scene = candidate_scenes[0]
+    print(
+        f"Warning: '{source_path}' looks like a BlendedMVS dataset root. Automatically selecting scene "
+        f"'{selected_scene.name}'. Pass a specific scene path or set BLENDEDMVS_SCENE_ID to avoid ambiguity."
+    )
+    return selected_scene, True
 
 def _readMapFreeIntrinsics(intrinsics_path, sequence_name):
     intrinsics_by_frame = {}
@@ -259,6 +319,103 @@ def _buildMapFreeCameraInfos(scene_root, sequence_name, eval, llffhold):
 
     return cam_infos, len(aligned_frame_paths), len(sampled_frame_paths)
 
+def _readBlendedMVSCamera(cam_path):
+    cam_path = Path(cam_path)
+    try:
+        lines = [line.strip() for line in cam_path.read_text().splitlines() if line.strip()]
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read BlendedMVS camera file '{cam_path}': {exc}") from exc
+
+    if len(lines) < 10:
+        raise RuntimeError(
+            f"Failed to parse BlendedMVS camera file '{cam_path}': expected at least 10 non-empty lines, got {len(lines)}."
+        )
+    if lines[0].lower() != "extrinsic" or lines[5].lower() != "intrinsic":
+        raise RuntimeError(
+            f"Failed to parse BlendedMVS camera file '{cam_path}': expected 'extrinsic' and 'intrinsic' sections."
+        )
+
+    try:
+        extrinsic = np.array([[float(value) for value in lines[idx].split()] for idx in range(1, 5)], dtype=np.float32)
+        intrinsic = np.array([[float(value) for value in lines[idx].split()] for idx in range(6, 9)], dtype=np.float32)
+    except ValueError as exc:
+        raise RuntimeError(f"Failed to parse numeric values from BlendedMVS camera file '{cam_path}': {exc}") from exc
+
+    if extrinsic.shape != (4, 4):
+        raise RuntimeError(
+            f"Failed to parse BlendedMVS camera file '{cam_path}': extrinsic has shape {extrinsic.shape}, expected (4, 4)."
+        )
+    if intrinsic.shape != (3, 3):
+        raise RuntimeError(
+            f"Failed to parse BlendedMVS camera file '{cam_path}': intrinsic has shape {intrinsic.shape}, expected (3, 3)."
+        )
+
+    return extrinsic, intrinsic
+
+def _buildBlendedMVSCameraInfos(scene_root, eval, llffhold):
+    scene_root = Path(scene_root)
+    images_dir = scene_root / "blended_images"
+    cams_dir = scene_root / "cams"
+
+    if not images_dir.is_dir():
+        raise RuntimeError(f"BlendedMVS scene '{scene_root}' is missing blended_images directory at '{images_dir}'.")
+    if not cams_dir.is_dir():
+        raise RuntimeError(f"BlendedMVS scene '{scene_root}' is missing cams directory at '{cams_dir}'.")
+
+    image_paths = sorted(
+        [
+            image_path for image_path in images_dir.iterdir()
+            if image_path.is_file()
+            and image_path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+            and not image_path.stem.endswith("_masked")
+        ],
+        key=_blendedmvs_frame_sort_key
+    )
+    if not image_paths:
+        raise RuntimeError(
+            f"No unmasked BlendedMVS images found in '{images_dir}'. Expected .jpg/.jpeg/.png files without '_masked'."
+        )
+
+    cam_paths_by_stem = {}
+    for cam_path in sorted(cams_dir.glob("*_cam.txt"), key=_blendedmvs_frame_sort_key):
+        stem = cam_path.stem[:-4] if cam_path.stem.endswith("_cam") else cam_path.stem
+        cam_paths_by_stem[stem] = cam_path
+
+    matched_image_paths = [image_path for image_path in image_paths if image_path.stem in cam_paths_by_stem]
+    if not matched_image_paths:
+        raise RuntimeError(
+            f"No BlendedMVS image/camera pairs found under '{scene_root}'. "
+            f"Checked images in '{images_dir}' against camera files in '{cams_dir}'."
+        )
+
+    cam_infos = []
+    for uid, image_path in enumerate(matched_image_paths):
+        cam_path = cam_paths_by_stem[image_path.stem]
+        w2c, intrinsic = _readBlendedMVSCamera(cam_path)
+
+        with Image.open(image_path) as image:
+            width, height = image.size
+
+        fx = float(intrinsic[0, 0])
+        fy = float(intrinsic[1, 1])
+
+        cam_infos.append(CameraInfo(
+            uid=uid,
+            R=np.transpose(w2c[:3, :3]),
+            T=w2c[:3, 3],
+            FovY=focal2fov(fy, height),
+            FovX=focal2fov(fx, width),
+            depth_params=None,
+            image_path=str(image_path),
+            image_name=image_path.stem,
+            depth_path="",
+            width=width,
+            height=height,
+            is_test=eval and llffhold and uid % llffhold == 0,
+        ))
+
+    return cam_infos, len(image_paths), len(matched_image_paths)
+
 def _loadMapFreePointCloud(scene_root, nerf_normalization):
     sparse_root = scene_root / "sparse" / "0"
     ply_path = sparse_root / "points3D.ply"
@@ -281,6 +438,36 @@ def _loadMapFreePointCloud(scene_root, nerf_normalization):
         print(f"Generating random MapFree point cloud ({num_pts})...")
         box_scale = 0.1
         radius = max(float(nerf_normalization["radius"]), 1e-3)*box_scale
+        center = -np.asarray(nerf_normalization["translate"])
+        rng = np.random.default_rng(0)
+        xyz = center + (rng.random((num_pts, 3)) * 2.0 - 1.0) * radius
+        shs = rng.random((num_pts, 3)) / 255.0
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    return fetchPly(ply_path), str(ply_path), "random"
+
+def _loadBlendedMVSPointCloud(scene_root, nerf_normalization):
+    scene_root = Path(scene_root)
+    sparse_root = scene_root / "sparse" / "0"
+    ply_path = sparse_root / "points3D.ply"
+    bin_path = sparse_root / "points3D.bin"
+    txt_path = sparse_root / "points3D.txt"
+
+    if ply_path.exists() or bin_path.exists() or txt_path.exists():
+        if not ply_path.exists():
+            print("Converting BlendedMVS sparse point cloud to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
+        return fetchPly(ply_path), str(ply_path), "colmap_sparse"
+
+    ply_path = scene_root / "blendedmvs_points3D.ply"
+    if not ply_path.exists():
+        num_pts = 10_000
+        print(f"Generating random BlendedMVS point cloud ({num_pts})...")
+        box_scale = 0.1
+        radius = max(float(nerf_normalization["radius"]), 1e-3) * box_scale
         center = -np.asarray(nerf_normalization["translate"])
         rng = np.random.default_rng(0)
         xyz = center + (rng.random((num_pts, 3)) * 2.0 - 1.0) * radius
@@ -488,8 +675,42 @@ def readMapFreeSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8)
                            is_nerf_synthetic=False)
     return scene_info
 
+def readBlendedMVSSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+    scene_root, resolved_from_dataset_root = resolveBlendedMVSScenePaths(path)
+    cam_infos, total_images, matched_frames = _buildBlendedMVSCameraInfos(scene_root, eval, llffhold)
+
+    train_cam_infos = [cam_info for cam_info in cam_infos if train_test_exp or not cam_info.is_test]
+    test_cam_infos = [cam_info for cam_info in cam_infos if cam_info.is_test]
+
+    if not train_cam_infos:
+        raise RuntimeError(
+            f"No BlendedMVS training cameras found for '{path}'. "
+            f"Found {total_images} unmasked images and {matched_frames} matched camera pairs in '{scene_root}'."
+        )
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    pcd, ply_path, point_cloud_source = _loadBlendedMVSPointCloud(scene_root, nerf_normalization)
+    if pcd is None:
+        raise RuntimeError(f"Failed to load or generate BlendedMVS point cloud at '{ply_path}'.")
+
+    scene_label = scene_root.name if not resolved_from_dataset_root else f"{scene_root.parent.name}/{scene_root.name}"
+    print(
+        f"Loaded BlendedMVS scene '{scene_label}': "
+        f"images={total_images}, matched={matched_frames}, train={len(train_cam_infos)}, "
+        f"test={len(test_cam_infos)}, point_cloud={point_cloud_source}."
+    )
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           is_nerf_synthetic=False)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
-    "MapFree": readMapFreeSceneInfo
+    "MapFree": readMapFreeSceneInfo,
+    "BlendedMVS": readBlendedMVSSceneInfo
 }
