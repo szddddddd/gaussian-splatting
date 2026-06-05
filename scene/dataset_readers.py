@@ -178,6 +178,170 @@ def _blendedmvs_frame_sort_key(path: Path):
         stem = stem[:-7]
     return (0, int(stem)) if stem.isdigit() else (1, stem)
 
+def _is_tartanair_image_dir(path: Path):
+    if not path.is_dir() or path.name not in {"image_left", "image_right"}:
+        return False
+
+    camera = "left" if path.name == "image_left" else "right"
+    pose_file = path.parent / f"pose_{camera}.txt"
+    if not pose_file.is_file():
+        return False
+
+    image_suffixes = {".png", ".jpg", ".jpeg"}
+    return any(image_path.is_file() and image_path.suffix.lower() in image_suffixes for image_path in path.iterdir())
+
+def isTartanAirScenePath(path):
+    return _is_tartanair_image_dir(Path(path))
+
+def resolveTartanAirScenePath(path):
+    image_dir = Path(path)
+    if not _is_tartanair_image_dir(image_dir):
+        raise RuntimeError(
+            f"Could not resolve TartanAir scene from '{path}'. Expected an 'image_left' or 'image_right' directory "
+            "whose parent contains the matching pose_left.txt or pose_right.txt file."
+        )
+
+    traj_dir = image_dir.parent
+    level_dir = traj_dir.parent
+    env_dir = level_dir.parent
+    camera = "left" if image_dir.name == "image_left" else "right"
+
+    return {
+        "image_dir": image_dir,
+        "traj_dir": traj_dir,
+        "level": level_dir.name,
+        "env_name": env_dir.name,
+        "camera": camera,
+        "pose_file": traj_dir / f"pose_{camera}.txt",
+        "scene_label": f"{env_dir.name}/{level_dir.name}/{traj_dir.name}/{image_dir.name}",
+    }
+
+def _get_tartanair_image_paths(image_dir: Path):
+    image_suffixes = {".png", ".jpg", ".jpeg"}
+
+    def tartanair_sort_key(path: Path):
+        frame_token = path.stem.split("_")[0]
+        if frame_token.isdigit():
+            return (0, int(frame_token), path.name)
+        digits = "".join(ch for ch in path.stem if ch.isdigit())
+        if digits:
+            return (1, int(digits), path.name)
+        return (2, path.name)
+
+    return sorted(
+        [image_path for image_path in image_dir.iterdir() if image_path.is_file() and image_path.suffix.lower() in image_suffixes],
+        key=tartanair_sort_key
+    )
+
+def _sampleTartanAirFrames(image_paths, sample_count=100):
+    if len(image_paths) <= sample_count:
+        return np.arange(len(image_paths), dtype=int)
+    return np.linspace(0, len(image_paths) - 1, sample_count, dtype=int)
+
+def _quat_xyzw_to_rotmat(qx, qy, qz, qw):
+    quat = np.array([qx, qy, qz, qw], dtype=np.float32)
+    norm = np.linalg.norm(quat)
+    if norm <= 1e-8:
+        raise RuntimeError("Encountered near-zero TartanAir quaternion while building camera poses.")
+    qx, qy, qz, qw = quat / norm
+
+    return np.array([
+        [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw), 2.0 * (qx * qz + qy * qw)],
+        [2.0 * (qx * qy + qz * qw), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
+        [2.0 * (qx * qz - qy * qw), 2.0 * (qy * qz + qx * qw), 1.0 - 2.0 * (qx * qx + qy * qy)],
+    ], dtype=np.float32)
+
+def _buildTartanAirCameraInfos(scene_paths, eval, llffhold):
+    image_dir = scene_paths["image_dir"]
+    pose_file = scene_paths["pose_file"]
+    image_paths = _get_tartanair_image_paths(image_dir)
+    if not image_paths:
+        raise RuntimeError(
+            f"No TartanAir images found in '{image_dir}'. Expected .png/.jpg/.jpeg files in the selected image folder."
+        )
+
+    try:
+        poses = np.loadtxt(pose_file, dtype=np.float32)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read TartanAir pose file '{pose_file}': {exc}") from exc
+
+    poses = np.atleast_2d(poses)
+    if poses.ndim != 2 or poses.shape[1] != 7:
+        raise RuntimeError(
+            f"Invalid TartanAir pose file '{pose_file}': expected Nx7 values 'tx ty tz qx qy qz qw', got shape {poses.shape}."
+        )
+    if poses.shape[0] != len(image_paths):
+        raise RuntimeError(
+            f"TartanAir image/pose count mismatch for '{scene_paths['scene_label']}': "
+            f"images={len(image_paths)}, poses={poses.shape[0]}."
+        )
+
+    sampled_indices = _sampleTartanAirFrames(image_paths)
+    A_cv_to_tartan = np.array([
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ], dtype=np.float32)
+
+    cam_infos = []
+    for uid, frame_idx in enumerate(sampled_indices.tolist()):
+        image_path = image_paths[frame_idx]
+        tx, ty, tz, qx, qy, qz, qw = poses[frame_idx]
+        camera_center = np.array([tx, ty, tz], dtype=np.float32)
+
+        R_c2w_tartan = _quat_xyzw_to_rotmat(qx, qy, qz, qw)
+        R_c2w_cv = R_c2w_tartan @ A_cv_to_tartan
+        R_w2c_cv = R_c2w_cv.T
+        T_w2c_cv = -R_w2c_cv @ camera_center
+
+        with Image.open(image_path) as image:
+            width, height = image.size
+
+        fx = 320.0
+        fy = 320.0
+        if (width, height) != (640, 480):
+            print(
+                f"Warning: TartanAir image '{image_path}' has size ({width}, {height}) instead of (640, 480). "
+                "Scaling intrinsics proportionally."
+            )
+            fx = fx * width / 640.0
+            fy = fy * height / 480.0
+
+        image_name = (
+            f"{scene_paths['env_name']}_{scene_paths['level']}_{scene_paths['traj_dir'].name}_"
+            f"{scene_paths['camera']}_{image_path.stem}"
+        )
+        cam_infos.append(CameraInfo(
+            uid=uid,
+            R=R_w2c_cv.T,
+            T=T_w2c_cv.astype(np.float32),
+            FovY=focal2fov(fy, height),
+            FovX=focal2fov(fx, width),
+            depth_params=None,
+            image_path=str(image_path.resolve()),
+            image_name=image_name,
+            depth_path="",
+            width=width,
+            height=height,
+            is_test=eval and llffhold and uid % llffhold == 0,
+        ))
+
+    return cam_infos, len(image_paths), len(sampled_indices), sampled_indices.tolist()
+
+def _loadTartanAirPointCloud(traj_dir, camera, nerf_normalization):
+    traj_dir = Path(traj_dir)
+    ply_path = traj_dir / f"tartanair_points3D_{camera}.ply"
+    if not ply_path.exists():
+        num_pts = 50_000
+        print(f"Generating random TartanAir point cloud ({num_pts})...")
+        center = -np.asarray(nerf_normalization["translate"], dtype=np.float32)
+        radius = max(float(nerf_normalization["radius"]), 1e-3)
+        rng = np.random.default_rng(0)
+        xyz = center + (rng.random((num_pts, 3), dtype=np.float32) * 2.0 - 1.0) * radius
+        shs = rng.random((num_pts, 3), dtype=np.float32) / 255.0
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    return fetchPly(ply_path), str(ply_path), "random"
+
 def isMapFreeScenePath(path):
     source_path = Path(path)
     return (
@@ -668,6 +832,47 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
                            is_nerf_synthetic=True)
     return scene_info
 
+def readTartanAirSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+    if depths != "":
+        print(f"Warning: depths argument '{depths}' is ignored for TartanAir scene '{path}'.")
+
+    scene_paths = resolveTartanAirScenePath(path)
+    cam_infos, total_images, sampled_images, sampled_indices = _buildTartanAirCameraInfos(scene_paths, eval, llffhold)
+
+    train_cam_infos = [cam_info for cam_info in cam_infos if train_test_exp or not cam_info.is_test]
+    test_cam_infos = [cam_info for cam_info in cam_infos if cam_info.is_test]
+
+    if not train_cam_infos:
+        raise RuntimeError(
+            f"No TartanAir training cameras found for '{path}'. "
+            f"Found {total_images} images and sampled {sampled_images} frames."
+        )
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    pcd, ply_path, point_cloud_source = _loadTartanAirPointCloud(
+        scene_paths["traj_dir"], scene_paths["camera"], nerf_normalization
+    )
+    if pcd is None:
+        raise RuntimeError(f"Failed to load or generate TartanAir point cloud at '{ply_path}'.")
+
+    print(
+        f"TartanAir sample indices for '{scene_paths['scene_label']}': "
+        f"first={sampled_indices[:5]}, last={sampled_indices[-5:]}."
+    )
+    print(
+        f"Loaded TartanAir scene '{scene_paths['scene_label']}': "
+        f"images={total_images}, sampled={sampled_images}, train={len(train_cam_infos)}, "
+        f"test={len(test_cam_infos)}, point_cloud={point_cloud_source}."
+    )
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           is_nerf_synthetic=False)
+    return scene_info
+
 def readMapFreeSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     scene_root, sequence_name = resolveMapFreeScenePath(path)
     cam_infos, total_aligned_frames, sampled_frames = _buildMapFreeCameraInfos(scene_root, sequence_name, eval, llffhold)
@@ -743,6 +948,7 @@ def readBlendedMVSSceneInfo(path, images, depths, eval, train_test_exp, llffhold
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
+    "TartanAir": readTartanAirSceneInfo,
     "MapFree": readMapFreeSceneInfo,
     "BlendedMVS": readBlendedMVSSceneInfo
 }

@@ -249,3 +249,152 @@ date -u '+%Y-%m-%d %H:%M'
 
 * Commit only the intended scene loader changes and `worklog.md` if you want to preserve this integration cleanly.
 
+## 2026-06-05 05:19 - Inspect TartanAir integration scope
+
+### Goal
+- Verify the local TartanAir layout, inspect the existing scene readers, and confirm the camera transform convention before patching.
+
+### Files inspected
+- `scene/dataset_readers.py`: inspect existing helper patterns, fallback point cloud generation, and callback registration.
+- `scene/__init__.py`: inspect automatic dataset detection and dispatch order.
+- `utils/graphics_utils.py`: confirm `getWorld2View2` expects `R` stored transposed and `T` in world-to-camera form.
+- `worklog.md`: append a new entry without overwriting previous records.
+- `/etc/codex/skills/karpathy-guidelines/SKILL.md`: follow the repository's minimal-change coding guidance.
+
+### Changes made
+- `worklog.md`: appended the TartanAir inspection record.
+
+### Commands run
+```bash
+pwd
+git status --short
+rg --files | sed -n '1,120p'
+sed -n '1,220p' AGENTS.md
+sed -n '1,220p' /etc/codex/skills/karpathy-guidelines/SKILL.md
+sed -n '1,320p' scene/dataset_readers.py
+sed -n '320,620p' scene/dataset_readers.py
+sed -n '620,780p' scene/dataset_readers.py
+sed -n '1,260p' scene/__init__.py
+sed -n '1,240p' utils/graphics_utils.py
+sed -n '1,200p' worklog.md
+find /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000 -maxdepth 2 -type d | sort
+find /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_left -maxdepth 1 -type f | sort | sed -n '1,5p'
+find /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_right -maxdepth 1 -type f | sort | sed -n '1,5p'
+find /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_left -maxdepth 1 -type f | wc -l
+find /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_right -maxdepth 1 -type f | wc -l
+wc -l /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/pose_left.txt /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/pose_right.txt
+date -u '+%Y-%m-%d %H:%M'
+```
+
+### Results
+
+* The target TartanAir trajectory exists locally with `image_left/`, `image_right/`, `pose_left.txt`, and `pose_right.txt`.
+* `image_left` and `image_right` each contain 1197 frames, and each pose file contains 1197 lines.
+* `getWorld2View2` stores `Rt[:3, :3] = R.transpose()`, so new reader code must pass `R = R_w2c.T` and `T = T_w2c`.
+
+### Current state
+
+* The required implementation scope is constrained to `scene/dataset_readers.py` and `scene/__init__.py`.
+* The real dataset layout matches the requested auto-detection pattern.
+
+### Next recommended step
+
+* Add the TartanAir helper functions, reader, and scene dispatch, then validate with `py_compile`, a direct reader smoke test, and a short training run.
+
+## 2026-06-05 05:25 - Implement and validate TartanAir reader
+
+### Goal
+- Add direct TartanAir v1 `image_left` / `image_right` scene loading and verify that `train.py -s <image_dir>` works end-to-end.
+
+### Files inspected
+- `scene/dataset_readers.py`: add TartanAir path detection, pose conversion, frame sampling, and random point cloud fallback.
+- `scene/__init__.py`: add TartanAir auto-detection in the scene dispatch flow.
+- `/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_left`: verify left camera image directory exists.
+- `/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_right`: verify right camera image directory exists.
+- `/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/pose_left.txt`: verify left pose file exists and frame count matches.
+- `/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/pose_right.txt`: verify right pose file exists and frame count matches.
+
+### Changes made
+- `scene/dataset_readers.py`: added `_is_tartanair_image_dir`, `isTartanAirScenePath`, `resolveTartanAirScenePath`, `_get_tartanair_image_paths`, `_sampleTartanAirFrames`, `_quat_xyzw_to_rotmat`, `_buildTartanAirCameraInfos`, `_loadTartanAirPointCloud`, and `readTartanAirSceneInfo`.
+- `scene/dataset_readers.py`: registered `sceneLoadTypeCallbacks["TartanAir"] = readTartanAirSceneInfo`.
+- `scene/__init__.py`: added automatic TartanAir path detection so `train.py -s .../image_left` and `train.py -s .../image_right` dispatch to the new reader.
+- `worklog.md`: appended implementation and validation details.
+
+### Commands run
+```bash
+sed -n '130,320p' scene/dataset_readers.py
+sed -n '640,760p' scene/dataset_readers.py
+sed -n '1,80p' scene/__init__.py
+git status --short
+bash -lc 'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate gaussian_splatting && python -m py_compile scene/dataset_readers.py scene/__init__.py'
+bash -lc 'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate gaussian_splatting && python - <<"PY"
+from pathlib import Path
+from scene.dataset_readers import resolveTartanAirScenePath, _get_tartanair_image_paths, _sampleTartanAirFrames
+
+for path_str in [
+    "/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_left",
+    "/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_right",
+]:
+    scene_paths = resolveTartanAirScenePath(path_str)
+    image_paths = _get_tartanair_image_paths(scene_paths["image_dir"])
+    pose_lines = sum(1 for _ in open(scene_paths["pose_file"], "r"))
+    sample_indices = _sampleTartanAirFrames(image_paths)
+    print(scene_paths["scene_label"])
+    print({
+        "images": len(image_paths),
+        "pose_lines": pose_lines,
+        "sampled": len(sample_indices),
+        "sample_first": sample_indices[:5].tolist(),
+        "sample_last": sample_indices[-5:].tolist(),
+    })
+PY'
+bash -lc 'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate gaussian_splatting && python - <<"PY"
+from scene.dataset_readers import readTartanAirSceneInfo
+import numpy as np
+p = "/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_right"
+s = readTartanAirSceneInfo(p, None, "", False, False)
+print("train", len(s.train_cameras), "test", len(s.test_cameras))
+c = s.train_cameras[0]
+print(c.image_path, c.width, c.height, c.FovX, c.FovY)
+print(c.R)
+print(c.T)
+assert len(s.train_cameras) == 100
+assert len(s.test_cameras) == 0
+assert np.isfinite(c.R).all()
+assert np.isfinite(c.T).all()
+assert c.FovX > 0 and c.FovY > 0
+PY'
+bash -lc 'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate gaussian_splatting && CUDA_VISIBLE_DEVICES=1 python train.py -s /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_right -m /data/new_disk7/szd/worldmodel_dataset/gaussian-splatting/output/tartanair_abandonedfactory_Hard_P000_right_test --iterations 1000 -r 4 --port 6010'
+git status --short
+rg -n "_is_tartanair_image_dir|isTartanAirScenePath|resolveTartanAirScenePath|_get_tartanair_image_paths|_sampleTartanAirFrames|_quat_xyzw_to_rotmat|_buildTartanAirCameraInfos|_loadTartanAirPointCloud|readTartanAirSceneInfo|TartanAir" scene/dataset_readers.py scene/__init__.py
+date -u '+%Y-%m-%d %H:%M'
+```
+
+### Results
+
+* `py_compile` passed for `scene/dataset_readers.py` and `scene/__init__.py`.
+* Local directory checks and helper-based sampling checks passed:
+  * `image_left`: 1197 images, 1197 pose lines, sampled 100 frames, first indices `[0, 12, 24, 36, 48]`, last indices `[1147, 1159, 1171, 1183, 1196]`
+  * `image_right`: 1197 images, 1197 pose lines, sampled 100 frames, first indices `[0, 12, 24, 36, 48]`, last indices `[1147, 1159, 1171, 1183, 1196]`
+* Direct reader smoke test passed for `image_right`:
+  * generated random point cloud: `/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/tartanair_points3D_right.ply`
+  * loaded 100 train cameras, 0 test cameras
+  * first camera image: `/data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_right/000000_right.png`
+  * first camera size: `640x480`
+  * first camera FOV: `FovX=1.5707963267948966`, `FovY=1.2870022175865687`
+  * first camera `R` and `T` were finite and contained no NaNs
+* Short training run passed:
+  * `train.py` automatically recognized the TartanAir image directory layout
+  * loader reported `images=1197, sampled=100, train=100, test=0, point_cloud=random`
+  * training initialized from 50000 random points
+  * run completed successfully with `[ITER 1000] Saving Gaussians` and `Training complete.`
+
+### Current state
+
+* `train.py -s /data/new_disk7/szd/worldmodel_dataset/tartanair/abandonedfactory/Hard/P000/image_right` now works without adding a new CLI loader flag.
+* The TartanAir reader only consumes the selected `image_left` or `image_right` folder and its matching pose file, without merging cameras or trajectories.
+* The generated fallback point cloud now exists for the tested right-camera trajectory.
+
+### Next recommended step
+
+* If needed, run a longer training job on the specific TartanAir trajectory you care about and inspect the produced reconstruction quality; the data-loading path itself is validated.

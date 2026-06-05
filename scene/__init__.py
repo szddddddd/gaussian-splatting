@@ -13,7 +13,7 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks, isMapFreeScenePath, isBlendedMVSScenePath
+from scene.dataset_readers import sceneLoadTypeCallbacks, isTartanAirScenePath, isMapFreeScenePath, isBlendedMVSScenePath
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
@@ -45,6 +45,9 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
+        elif isTartanAirScenePath(args.source_path):
+            print("Found TartanAir image directory layout, assuming TartanAir train scene!")
+            scene_info = sceneLoadTypeCallbacks["TartanAir"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
         elif isMapFreeScenePath(args.source_path):
             print("Found MapFree scene metadata, assuming MapFree train scene!")
             scene_info = sceneLoadTypeCallbacks["MapFree"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
