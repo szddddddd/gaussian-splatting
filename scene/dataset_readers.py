@@ -145,12 +145,30 @@ def storePly(path, xyz, rgb):
 def _has_mapfree_metadata(path: Path):
     return (path / "intrinsics.txt").exists() and (path / "poses.txt").exists()
 
+def _is_blendedmvs_image_file(path: Path):
+    return (
+        path.is_file()
+        and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        and not path.stem.endswith("_masked")
+    )
+
+def _get_blendedmvs_image_paths(images_dir: Path):
+    return sorted(
+        [image_path for image_path in images_dir.iterdir() if _is_blendedmvs_image_file(image_path)],
+        key=_blendedmvs_frame_sort_key
+    )
+
 def _has_blendedmvs_scene_layout(path: Path):
     if not path.is_dir():
         return False
     images_dir = path / "blended_images"
     cams_dir = path / "cams"
-    return images_dir.is_dir() and cams_dir.is_dir() and any(cams_dir.glob("*_cam.txt"))
+    return (
+        images_dir.is_dir()
+        and cams_dir.is_dir()
+        and any(cams_dir.glob("*_cam.txt"))
+        and any(_is_blendedmvs_image_file(image_path) for image_path in images_dir.iterdir())
+    )
 
 def _blendedmvs_frame_sort_key(path: Path):
     stem = path.stem
@@ -186,7 +204,7 @@ def resolveMapFreeScenePath(path):
         "intrinsics.txt, poses.txt, and seq0/, or the seq0 directory itself."
     )
 
-def resolveBlendedMVSScenePaths(path):
+def resolveBlendedMVSScenePath(path):
     source_path = Path(path)
     if _has_blendedmvs_scene_layout(source_path):
         return source_path, False
@@ -218,10 +236,14 @@ def resolveBlendedMVSScenePaths(path):
 
     selected_scene = candidate_scenes[0]
     print(
-        f"Warning: '{source_path}' looks like a BlendedMVS dataset root. Automatically selecting scene "
-        f"'{selected_scene.name}'. Pass a specific scene path or set BLENDEDMVS_SCENE_ID to avoid ambiguity."
+        f"Warning: source_path '{source_path}' looks like a BlendedMVS dataset root. "
+        f"Automatically selecting scene '{selected_scene.name}'. For training, it is recommended "
+        "to pass a specific scene path or set BLENDEDMVS_SCENE_ID."
     )
     return selected_scene, True
+
+def resolveBlendedMVSScenePaths(path):
+    return resolveBlendedMVSScenePath(path)
 
 def _readMapFreeIntrinsics(intrinsics_path, sequence_name):
     intrinsics_by_frame = {}
@@ -326,18 +348,30 @@ def _readBlendedMVSCamera(cam_path):
     except Exception as exc:
         raise RuntimeError(f"Failed to read BlendedMVS camera file '{cam_path}': {exc}") from exc
 
-    if len(lines) < 10:
-        raise RuntimeError(
-            f"Failed to parse BlendedMVS camera file '{cam_path}': expected at least 10 non-empty lines, got {len(lines)}."
-        )
-    if lines[0].lower() != "extrinsic" or lines[5].lower() != "intrinsic":
+    try:
+        extrinsic_index = next(idx for idx, line in enumerate(lines) if line.lower() == "extrinsic")
+        intrinsic_index = next(idx for idx, line in enumerate(lines) if line.lower() == "intrinsic")
+    except StopIteration as exc:
         raise RuntimeError(
             f"Failed to parse BlendedMVS camera file '{cam_path}': expected 'extrinsic' and 'intrinsic' sections."
+        ) from exc
+
+    if intrinsic_index <= extrinsic_index:
+        raise RuntimeError(
+            f"Failed to parse BlendedMVS camera file '{cam_path}': 'intrinsic' section appears before 'extrinsic'."
+        )
+
+    extrinsic_rows = lines[extrinsic_index + 1:extrinsic_index + 5]
+    intrinsic_rows = lines[intrinsic_index + 1:intrinsic_index + 4]
+    if len(extrinsic_rows) != 4 or len(intrinsic_rows) != 3:
+        raise RuntimeError(
+            f"Failed to parse BlendedMVS camera file '{cam_path}': expected 4 extrinsic rows and 3 intrinsic rows, "
+            f"got {len(extrinsic_rows)} and {len(intrinsic_rows)}."
         )
 
     try:
-        extrinsic = np.array([[float(value) for value in lines[idx].split()] for idx in range(1, 5)], dtype=np.float32)
-        intrinsic = np.array([[float(value) for value in lines[idx].split()] for idx in range(6, 9)], dtype=np.float32)
+        extrinsic = np.array([[float(value) for value in row.split()] for row in extrinsic_rows], dtype=np.float32)
+        intrinsic = np.array([[float(value) for value in row.split()] for row in intrinsic_rows], dtype=np.float32)
     except ValueError as exc:
         raise RuntimeError(f"Failed to parse numeric values from BlendedMVS camera file '{cam_path}': {exc}") from exc
 
@@ -362,15 +396,7 @@ def _buildBlendedMVSCameraInfos(scene_root, eval, llffhold):
     if not cams_dir.is_dir():
         raise RuntimeError(f"BlendedMVS scene '{scene_root}' is missing cams directory at '{cams_dir}'.")
 
-    image_paths = sorted(
-        [
-            image_path for image_path in images_dir.iterdir()
-            if image_path.is_file()
-            and image_path.suffix.lower() in {".jpg", ".jpeg", ".png"}
-            and not image_path.stem.endswith("_masked")
-        ],
-        key=_blendedmvs_frame_sort_key
-    )
+    image_paths = _get_blendedmvs_image_paths(images_dir)
     if not image_paths:
         raise RuntimeError(
             f"No unmasked BlendedMVS images found in '{images_dir}'. Expected .jpg/.jpeg/.png files without '_masked'."
@@ -676,7 +702,13 @@ def readMapFreeSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8)
     return scene_info
 
 def readBlendedMVSSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
-    scene_root, resolved_from_dataset_root = resolveBlendedMVSScenePaths(path)
+    if depths != "":
+        print(
+            f"Warning: depths argument '{depths}' is ignored for BlendedMVS scene '{path}'. "
+            "rendered_depth_maps are not connected to training yet."
+        )
+
+    scene_root, resolved_from_dataset_root = resolveBlendedMVSScenePath(path)
     cam_infos, total_images, matched_frames = _buildBlendedMVSCameraInfos(scene_root, eval, llffhold)
 
     train_cam_infos = [cam_info for cam_info in cam_infos if train_test_exp or not cam_info.is_test]
