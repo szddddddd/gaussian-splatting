@@ -18,6 +18,7 @@ from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
+import re
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
@@ -189,6 +190,419 @@ def _is_tartanair_image_dir(path: Path):
 
     image_suffixes = {".png", ".jpg", ".jpeg"}
     return any(image_path.is_file() and image_path.suffix.lower() in image_suffixes for image_path in path.iterdir())
+
+def _natural_frame_sort_key(path: Path):
+    parts = re.split(r"(\d+)", path.stem)
+    natural_parts = [int(part) if part.isdigit() else part for part in parts]
+    return natural_parts + [path.suffix.lower(), path.name]
+
+def _is_unreal4k_image_dir(path: Path):
+    if not path.is_dir() or path.name not in {"Image0", "Image1"}:
+        return False
+
+    camera_index = path.name[-1]
+    extrinsic_dir = path.parent / f"Extrinsics{camera_index}"
+    if not extrinsic_dir.is_dir():
+        return False
+
+    image_suffixes = {".png", ".jpg", ".jpeg"}
+    return any(image_path.is_file() and image_path.suffix.lower() in image_suffixes for image_path in path.iterdir())
+
+def isUnrealStereo4KScenePath(path):
+    return _is_unreal4k_image_dir(Path(path))
+
+def isUnrealStereo4KSceneRootPath(path):
+    source_path = Path(path)
+    return (
+        source_path.is_dir()
+        and (source_path / "Image0").is_dir()
+        and (source_path / "Image1").is_dir()
+        and (source_path / "Extrinsics0").is_dir()
+        and (source_path / "Extrinsics1").is_dir()
+    )
+
+def resolveUnrealStereo4KScenePath(path):
+    image_dir = Path(path)
+    if isUnrealStereo4KSceneRootPath(image_dir):
+        raise RuntimeError(
+            f"UnrealStereo4K source_path '{path}' is a scene root. Pass a single stereo image directory instead, "
+            f"for example '{image_dir / 'Image0'}' or '{image_dir / 'Image1'}'."
+        )
+    if image_dir.name not in {"Image0", "Image1"}:
+        raise RuntimeError(
+            f"Could not resolve UnrealStereo4K scene from '{path}'. Expected a single scene image directory named "
+            "'Image0' or 'Image1', not the dataset root or another folder."
+        )
+    if not image_dir.is_dir():
+        raise RuntimeError(f"UnrealStereo4K image directory does not exist: '{image_dir}'.")
+
+    camera_index = image_dir.name[-1]
+    scene_root = image_dir.parent
+    extrinsic_dir = scene_root / f"Extrinsics{camera_index}"
+    if not extrinsic_dir.is_dir():
+        raise RuntimeError(
+            f"UnrealStereo4K '{image_dir.name}' expects matching extrinsics at '{extrinsic_dir}', but that directory "
+            "was not found."
+        )
+
+    return {
+        "scene_root": scene_root,
+        "image_dir": image_dir,
+        "extrinsic_dir": extrinsic_dir,
+        "camera_name": image_dir.name,
+        "scene_label": f"{scene_root.name}/{image_dir.name}",
+    }
+
+def _get_unreal4k_image_paths(image_dir: Path):
+    image_suffixes = {".png", ".jpg", ".jpeg"}
+    raw_paths = [image_path for image_path in image_dir.iterdir() if image_path.is_file() and image_path.suffix.lower() == ".raw"]
+    image_paths = sorted(
+        [image_path for image_path in image_dir.iterdir() if image_path.is_file() and image_path.suffix.lower() in image_suffixes],
+        key=_natural_frame_sort_key
+    )
+    if raw_paths and not image_paths:
+        raise RuntimeError(
+            f"UnrealStereo4K image directory '{image_dir}' contains .raw files, but this reader currently supports "
+            "only .png, .jpg, and .jpeg."
+        )
+    if raw_paths:
+        print(
+            f"Warning: UnrealStereo4K image directory '{image_dir}' contains {len(raw_paths)} .raw files; "
+            "ignoring them and using .png/.jpg/.jpeg files only."
+        )
+    return image_paths
+
+def _sampleUnreal4KFrames(image_paths, sample_count=100):
+    if len(image_paths) <= sample_count:
+        return np.arange(len(image_paths), dtype=int)
+    return np.unique(np.linspace(0, len(image_paths) - 1, sample_count, dtype=int))
+
+def _matrix4x4_from_values(values, source_path):
+    values = np.asarray(values, dtype=np.float32)
+    if values.shape == (4, 4):
+        return values
+    if values.shape == (3, 4):
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[:3, :4] = values
+        return matrix
+    flat = values.reshape(-1)
+    if flat.size == 16:
+        return flat.reshape(4, 4)
+    if flat.size == 12:
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[:3, :4] = flat.reshape(3, 4)
+        return matrix
+    raise RuntimeError(
+        f"Failed to parse UnrealStereo4K extrinsic '{source_path}': expected a 4x4 matrix, 3x4 matrix, "
+        f"or flat 16/12 values, got shape {values.shape} with {flat.size} values."
+    )
+
+def _intrinsic3x3_from_values(values, source_path):
+    values = np.asarray(values, dtype=np.float32)
+    if values.shape == (3, 3):
+        return values
+    flat = values.reshape(-1)
+    if flat.size == 9:
+        return flat.reshape(3, 3)
+    if flat.size >= 4:
+        fx, fy, cx, cy = flat[:4]
+        return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+    raise RuntimeError(
+        f"Failed to parse UnrealStereo4K intrinsics '{source_path}': expected a 3x3 matrix or fx fy cx cy values."
+    )
+
+def _readUnreal4KExtrinsic(extrinsic_path: Path):
+    extrinsic_path = Path(extrinsic_path)
+    suffix = extrinsic_path.suffix.lower()
+
+    if suffix == ".npy":
+        try:
+            loaded = np.load(extrinsic_path, allow_pickle=True)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read UnrealStereo4K npy extrinsic '{extrinsic_path}': {exc}") from exc
+        if isinstance(loaded, np.ndarray) and loaded.shape == ():
+            loaded = loaded.item()
+        if isinstance(loaded, dict):
+            extrinsic_values = loaded.get("extrinsic", loaded.get("extrinsics", loaded.get("matrix", loaded.get("pose"))))
+            intrinsic_values = loaded.get("intrinsic", loaded.get("intrinsics", loaded.get("K", loaded.get("camera_matrix"))))
+            if extrinsic_values is None:
+                raise RuntimeError(f"UnrealStereo4K npy extrinsic '{extrinsic_path}' does not contain an extrinsic matrix key.")
+            intrinsic = _intrinsic3x3_from_values(intrinsic_values, extrinsic_path) if intrinsic_values is not None else None
+            return _matrix4x4_from_values(extrinsic_values, extrinsic_path), intrinsic
+        return _matrix4x4_from_values(loaded, extrinsic_path), None
+
+    if suffix == ".json":
+        try:
+            data = json.loads(extrinsic_path.read_text())
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read UnrealStereo4K json extrinsic '{extrinsic_path}': {exc}") from exc
+        extrinsic_values = data.get("extrinsic", data.get("extrinsics", data.get("matrix", data.get("pose", data.get("transform_matrix")))))
+        intrinsic_values = data.get("intrinsic", data.get("intrinsics", data.get("K", data.get("camera_matrix"))))
+        if extrinsic_values is None:
+            raise RuntimeError(f"UnrealStereo4K json extrinsic '{extrinsic_path}' does not contain an extrinsic matrix key.")
+        intrinsic = _intrinsic3x3_from_values(intrinsic_values, extrinsic_path) if intrinsic_values is not None else None
+        return _matrix4x4_from_values(extrinsic_values, extrinsic_path), intrinsic
+
+    try:
+        rows = []
+        for line in extrinsic_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            rows.append([float(value) for value in line.replace(",", " ").split()])
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read UnrealStereo4K text extrinsic '{extrinsic_path}': {exc}") from exc
+
+    if not rows:
+        raise RuntimeError(f"UnrealStereo4K extrinsic file '{extrinsic_path}' is empty.")
+
+    intrinsic = None
+    if len(rows) >= 2 and len(rows[0]) == 9 and len(rows[1]) in {12, 16}:
+        intrinsic = _intrinsic3x3_from_values(rows[0], extrinsic_path)
+        return _matrix4x4_from_values(rows[1], extrinsic_path), intrinsic
+
+    row_lengths = {len(row) for row in rows}
+    if len(row_lengths) == 1:
+        matrix = np.array(rows, dtype=np.float32)
+        return _matrix4x4_from_values(matrix, extrinsic_path), intrinsic
+
+    flat = [value for row in rows for value in row]
+    if len(flat) in {12, 16}:
+        return _matrix4x4_from_values(flat, extrinsic_path), intrinsic
+    if len(flat) in {21, 25}:
+        intrinsic = _intrinsic3x3_from_values(flat[:9], extrinsic_path)
+        return _matrix4x4_from_values(flat[9:], extrinsic_path), intrinsic
+
+    raise RuntimeError(
+        f"Failed to parse UnrealStereo4K extrinsic '{extrinsic_path}': unsupported row lengths "
+        f"{[len(row) for row in rows]}."
+    )
+
+def _read_unreal4k_intrinsics_file(path: Path):
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        data = json.loads(path.read_text())
+        values = data.get("intrinsic", data.get("intrinsics", data.get("K", data.get("camera_matrix"))))
+        if values is None and all(key in data for key in ("fx", "fy", "cx", "cy")):
+            values = [data["fx"], data["fy"], data["cx"], data["cy"]]
+        if values is None:
+            raise RuntimeError(f"UnrealStereo4K intrinsics json '{path}' does not contain K or fx/fy/cx/cy.")
+        return _intrinsic3x3_from_values(values, path)
+    if suffix == ".npy":
+        loaded = np.load(path, allow_pickle=True)
+        if isinstance(loaded, np.ndarray) and loaded.shape == ():
+            loaded = loaded.item()
+        if isinstance(loaded, dict):
+            values = loaded.get("intrinsic", loaded.get("intrinsics", loaded.get("K", loaded.get("camera_matrix"))))
+            if values is None and all(key in loaded for key in ("fx", "fy", "cx", "cy")):
+                values = [loaded["fx"], loaded["fy"], loaded["cx"], loaded["cy"]]
+            if values is None:
+                raise RuntimeError(f"UnrealStereo4K intrinsics npy '{path}' does not contain K or fx/fy/cx/cy.")
+            return _intrinsic3x3_from_values(values, path)
+        return _intrinsic3x3_from_values(loaded, path)
+
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        rows.extend(float(value) for value in line.replace(",", " ").split())
+    return _intrinsic3x3_from_values(rows, path)
+
+def _intrinsics_result_from_matrix(intrinsic, width, height, source):
+    fx = float(intrinsic[0, 0])
+    fy = float(intrinsic[1, 1])
+    cx = float(intrinsic[0, 2])
+    cy = float(intrinsic[1, 2])
+    if abs(cx - width * 0.5) > 1.0 or abs(cy - height * 0.5) > 1.0:
+        print(
+            f"Warning: UnrealStereo4K intrinsics source '{source}' has principal point ({cx:.3f}, {cy:.3f}), "
+            f"but CameraInfo stores only FOV. Training will use FOV and ignore principal point offset."
+        )
+    return {
+        "FovX": focal2fov(fx, width),
+        "FovY": focal2fov(fy, height),
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "matrix": intrinsic,
+        "source": source,
+    }
+
+def _read_or_infer_unreal4k_intrinsics(scene_root, image_dir, width, height, embedded_intrinsic=None):
+    scene_root = Path(scene_root)
+    image_dir = Path(image_dir)
+    camera_index = image_dir.name[-1] if image_dir.name in {"Image0", "Image1"} else ""
+    candidates = [
+        scene_root / f"Intrinsics{camera_index}.txt",
+        scene_root / f"Intrinsics{camera_index}.json",
+        scene_root / f"Intrinsics{camera_index}.npy",
+        scene_root / "intrinsics.txt",
+        scene_root / "intrinsics.json",
+        scene_root / "camera.txt",
+        scene_root / "camera.json",
+        scene_root / "cameras.json",
+        scene_root / "calib.txt",
+        scene_root / "metadata.json",
+    ]
+    intrinsics_dir = scene_root / f"Intrinsics{camera_index}"
+    if intrinsics_dir.is_dir():
+        candidates.extend(sorted(
+            [path for path in intrinsics_dir.iterdir() if path.is_file() and path.suffix.lower() in {".txt", ".json", ".npy"}],
+            key=_natural_frame_sort_key
+        ))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            intrinsic = _read_unreal4k_intrinsics_file(candidate)
+            return _intrinsics_result_from_matrix(intrinsic, width, height, f"metadata:{candidate.name}")
+
+    if embedded_intrinsic is not None:
+        return _intrinsics_result_from_matrix(embedded_intrinsic, width, height, "extrinsics_txt")
+
+    fovx_deg = float(os.environ.get("UNREAL4K_FOVX_DEG", "90.0"))
+    fovx = np.deg2rad(fovx_deg)
+    fx = fov2focal(fovx, width)
+    fy = fx
+    fovy = focal2fov(fy, height)
+    print(
+        f"Warning: no UnrealStereo4K intrinsics metadata found under '{scene_root}' for {image_dir.name}. "
+        f"Using fallback UNREAL4K_FOVX_DEG={fovx_deg:.3f}; principal point is assumed at image center because "
+        "CameraInfo does not store cx/cy."
+    )
+    return {
+        "FovX": fovx,
+        "FovY": fovy,
+        "fx": fx,
+        "fy": fy,
+        "cx": width * 0.5,
+        "cy": height * 0.5,
+        "matrix": np.array([[fx, 0.0, width * 0.5], [0.0, fy, height * 0.5], [0.0, 0.0, 1.0]], dtype=np.float32),
+        "source": "fallback",
+    }
+
+def _unreal4k_extrinsic_convention():
+    requested = os.environ.get("UNREAL4K_EXTRINSIC_CONVENTION", "w2c").strip().lower()
+    if requested not in {"w2c", "c2w", "auto"}:
+        raise RuntimeError(
+            "UNREAL4K_EXTRINSIC_CONVENTION must be one of 'w2c', 'c2w', or 'auto', "
+            f"got '{requested}'."
+        )
+    if requested == "auto":
+        return "w2c", "auto->w2c"
+    return requested, requested
+
+def _unreal4k_to_w2c(extrinsic, convention):
+    if convention == "w2c":
+        return extrinsic
+    if convention == "c2w":
+        return np.linalg.inv(extrinsic)
+    raise RuntimeError(f"Unsupported UnrealStereo4K extrinsic convention '{convention}'.")
+
+def _buildUnrealStereo4KCameraInfos(scene_paths, eval, llffhold):
+    image_dir = scene_paths["image_dir"]
+    extrinsic_dir = scene_paths["extrinsic_dir"]
+    scene_root = scene_paths["scene_root"]
+    image_paths = _get_unreal4k_image_paths(image_dir)
+    if not image_paths:
+        raise RuntimeError(
+            f"No UnrealStereo4K images found in '{image_dir}'. Expected .png/.jpg/.jpeg files in the selected "
+            "Image0 or Image1 folder."
+        )
+
+    extrinsic_suffixes = {".txt", ".json", ".npy"}
+    extrinsic_paths = sorted(
+        [path for path in extrinsic_dir.iterdir() if path.is_file() and path.suffix.lower() in extrinsic_suffixes],
+        key=_natural_frame_sort_key
+    )
+    if len(extrinsic_paths) != len(image_paths):
+        raise RuntimeError(
+            f"UnrealStereo4K image/extrinsic count mismatch for '{scene_paths['scene_label']}': "
+            f"images={len(image_paths)} in '{image_dir}', extrinsics={len(extrinsic_paths)} in '{extrinsic_dir}'."
+        )
+
+    image_stems = {path.stem for path in image_paths}
+    extrinsic_stems = {path.stem for path in extrinsic_paths}
+    missing_extrinsics = sorted(image_stems - extrinsic_stems, key=lambda stem: _natural_frame_sort_key(Path(stem)))
+    missing_images = sorted(extrinsic_stems - image_stems, key=lambda stem: _natural_frame_sort_key(Path(stem)))
+    if missing_extrinsics or missing_images:
+        raise RuntimeError(
+            f"UnrealStereo4K image/extrinsic stem mismatch for '{scene_paths['scene_label']}': "
+            f"missing extrinsics for images={missing_extrinsics[:5]}, missing images for extrinsics={missing_images[:5]}."
+        )
+    extrinsic_by_stem = {path.stem: path for path in extrinsic_paths}
+
+    sampled_indices = _sampleUnreal4KFrames(image_paths)
+    with Image.open(image_paths[int(sampled_indices[0])]) as first_image:
+        first_width, first_height = first_image.size
+
+    first_extrinsic_path = extrinsic_by_stem[image_paths[int(sampled_indices[0])].stem]
+    _, first_intrinsic = _readUnreal4KExtrinsic(first_extrinsic_path)
+    base_intrinsics = _read_or_infer_unreal4k_intrinsics(scene_root, image_dir, first_width, first_height, first_intrinsic)
+    convention, convention_label = _unreal4k_extrinsic_convention()
+
+    cam_infos = []
+    warned_intrinsics_change = False
+    for uid, frame_idx in enumerate(sampled_indices.tolist()):
+        image_path = image_paths[frame_idx]
+        extrinsic_path = extrinsic_by_stem[image_path.stem]
+        extrinsic, embedded_intrinsic = _readUnreal4KExtrinsic(extrinsic_path)
+        w2c = _unreal4k_to_w2c(extrinsic, convention)
+
+        with Image.open(image_path) as image:
+            width, height = image.size
+
+        intrinsics = base_intrinsics
+        if base_intrinsics["source"] == "extrinsics_txt" and embedded_intrinsic is not None:
+            if not np.allclose(embedded_intrinsic, base_intrinsics["matrix"], rtol=1e-5, atol=1e-4) and not warned_intrinsics_change:
+                print(
+                    f"Warning: UnrealStereo4K embedded intrinsics vary across frames in '{scene_paths['scene_label']}'. "
+                    "Using each frame's embedded intrinsics where available."
+                )
+                warned_intrinsics_change = True
+            intrinsics = _intrinsics_result_from_matrix(embedded_intrinsic, width, height, "extrinsics_txt")
+
+        cam_infos.append(CameraInfo(
+            uid=uid,
+            R=np.transpose(w2c[:3, :3]),
+            T=w2c[:3, 3],
+            FovY=intrinsics["FovY"],
+            FovX=intrinsics["FovX"],
+            depth_params=None,
+            image_path=str(image_path.resolve()),
+            image_name=f"{scene_root.name}_{image_dir.name}_{image_path.stem}",
+            depth_path="",
+            width=width,
+            height=height,
+            is_test=eval and llffhold and uid % llffhold == 0,
+        ))
+
+    return {
+        "cam_infos": cam_infos,
+        "total_images": len(image_paths),
+        "sampled_images": len(sampled_indices),
+        "sampled_indices": sampled_indices.tolist(),
+        "resolution": (first_width, first_height),
+        "extrinsic_convention": convention_label,
+        "intrinsics_source": base_intrinsics["source"],
+    }
+
+def _loadUnrealStereo4KPointCloud(scene_root, camera_name, nerf_normalization):
+    scene_root = Path(scene_root)
+    ply_path = scene_root / f"unreal4k_points3D_{camera_name}.ply"
+    if ply_path.exists():
+        return fetchPly(ply_path), str(ply_path), "existing"
+
+    num_pts = 50_000
+    print(f"Generating random UnrealStereo4K point cloud ({num_pts})...")
+    center = -np.asarray(nerf_normalization["translate"], dtype=np.float32)
+    radius = max(float(nerf_normalization["radius"]), 1e-3)
+    rng = np.random.default_rng(0)
+    xyz = center + (rng.random((num_pts, 3), dtype=np.float32) * 2.0 - 1.0) * radius
+    shs = rng.random((num_pts, 3), dtype=np.float32) / 255.0
+    storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    return fetchPly(ply_path), str(ply_path), "random"
 
 def isTartanAirScenePath(path):
     return _is_tartanair_image_dir(Path(path))
@@ -873,6 +1287,56 @@ def readTartanAirSceneInfo(path, images, depths, eval, train_test_exp, llffhold=
                            is_nerf_synthetic=False)
     return scene_info
 
+def readUnrealStereo4KSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+    if images not in {None, "images"}:
+        print(f"Warning: images argument '{images}' is ignored for UnrealStereo4K scene '{path}'. Pass Image0/Image1 as source_path.")
+    if depths != "":
+        print(
+            f"Warning: depths argument '{depths}' is ignored for UnrealStereo4K scene '{path}'. "
+            "Disp0/Disp1 are not connected to training yet."
+        )
+
+    scene_paths = resolveUnrealStereo4KScenePath(path)
+    build_result = _buildUnrealStereo4KCameraInfos(scene_paths, eval, llffhold)
+    cam_infos = build_result["cam_infos"]
+
+    train_cam_infos = [cam_info for cam_info in cam_infos if train_test_exp or not cam_info.is_test]
+    test_cam_infos = [cam_info for cam_info in cam_infos if cam_info.is_test]
+
+    if not train_cam_infos:
+        raise RuntimeError(
+            f"No UnrealStereo4K training cameras found for '{path}'. "
+            f"Found {build_result['total_images']} images and sampled {build_result['sampled_images']} frames."
+        )
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    pcd, ply_path, point_cloud_source = _loadUnrealStereo4KPointCloud(
+        scene_paths["scene_root"], scene_paths["camera_name"], nerf_normalization
+    )
+    if pcd is None:
+        raise RuntimeError(f"Failed to load or generate UnrealStereo4K point cloud at '{ply_path}'.")
+
+    print(
+        f"UnrealStereo4K sample indices for '{scene_paths['scene_label']}': "
+        f"first={build_result['sampled_indices'][:5]}, last={build_result['sampled_indices'][-5:]}."
+    )
+    print(
+        f"Loaded UnrealStereo4K scene '{scene_paths['scene_label']}': "
+        f"camera_side={scene_paths['camera_name']}, images={build_result['total_images']}, "
+        f"sampled={build_result['sampled_images']}, train={len(train_cam_infos)}, test={len(test_cam_infos)}, "
+        f"resolution={build_result['resolution'][0]}x{build_result['resolution'][1]}, "
+        f"extrinsic_convention={build_result['extrinsic_convention']}, "
+        f"intrinsics_source={build_result['intrinsics_source']}, point_cloud={point_cloud_source}."
+    )
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           is_nerf_synthetic=False)
+    return scene_info
+
 def readMapFreeSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     scene_root, sequence_name = resolveMapFreeScenePath(path)
     cam_infos, total_aligned_frames, sampled_frames = _buildMapFreeCameraInfos(scene_root, sequence_name, eval, llffhold)
@@ -949,6 +1413,7 @@ sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
     "TartanAir": readTartanAirSceneInfo,
+    "UnrealStereo4K": readUnrealStereo4KSceneInfo,
     "MapFree": readMapFreeSceneInfo,
     "BlendedMVS": readBlendedMVSSceneInfo
 }
